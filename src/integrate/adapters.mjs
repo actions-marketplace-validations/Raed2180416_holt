@@ -206,6 +206,23 @@ ${bin} context <worktree-id>     # who else is editing your files, what already 
 ${bin} status                    # collisions, duplicates, what is at risk
 \`\`\`
 
+### Claim a live edit session
+
+If you are about to edit a clean linked worktree, claim it before the first edit and use a real,
+opaque session identifier. Renew while working, then hand it off or release it when you stop:
+
+\`\`\`bash
+${bin} ownership claim <worktree-id> --owner <session-id>
+${bin} ownership heartbeat <worktree-id> --owner <session-id>
+${bin} ownership handoff <worktree-id> --owner <session-id> --to <next-session-id>
+${bin} ownership release <worktree-id> --owner <session-id>
+\`\`\`
+
+An active lease blocks cleanup even when no changed bytes are visible. An expired, malformed, or
+unreadable lease is a review block, not evidence that the agent died. An unclaimed worktree is
+also **not** proof that nobody is editing it: Holt does not infer liveness from process lists,
+names, or mtimes. Only sessions that claim themselves receive this extra protection.
+
 If a symbol you are about to write already exists in another workstream, reuse or coordinate —
 do not build it twice. Add \`--json\` to any command for machine-readable output.
 ${HOLT_END}`;
@@ -1217,11 +1234,11 @@ export function codexHooks(bin = 'holt') {
       PreToolUse: [
         {
           // Codex's current hook contract names apply_patch as a canonical PreToolUse path and
-          // passes its patch DSL in tool_input.command. That exact grammar lets Holt measure Delete
-          // File and rename-destination replacement without putting ordinary Update File hunks in
-          // the expensive scan path. Other local functions and MCP inputs are tool-specific and
-          // deliberately remain unclaimed.
-          matcher: 'Bash|apply_patch',
+          // passes its patch DSL in tool_input.command. The broad matcher is deliberate: Codex
+          // also routes MCP and other local function tools through PreToolUse, and a narrow matcher
+          // made those calls silently bypass Holt. cmdHook asks for an exact configured contract
+          // before allowing any non-shell tool; ordinary Update File hunks still stay cheap.
+          matcher: 'Bash|apply_patch|.*',
           hooks: [
             { type: 'command', command: `${bin} hook pre-tool-use --host codex`, timeout: 120 },
           ],

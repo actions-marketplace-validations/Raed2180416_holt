@@ -110,6 +110,12 @@ export function renderHeader(report, u = repoData()) {
     `  scanned   ${k.scanned}/${k.workstreams} workstreams in ${k.families} famil${k.families === 1 ? 'y' : 'ies'}` +
     (k.skipped ? c('yellow', `  ·  ${k.skipped} skipped`) : ''),
   );
+  if ((k.activeOwnership ?? 0) || (k.ownershipNeedsReview ?? 0)) {
+    lines.push(
+      `  ownership ${k.activeOwnership ?? 0} active lease(s)`
+      + ((k.ownershipNeedsReview ?? 0) ? c('yellow', `  ·  ${k.ownershipNeedsReview} need review`) : ''),
+    );
+  }
   return lines.join('\n');
 }
 
@@ -184,7 +190,8 @@ export function renderSummary(report) {
   const out = [renderHeader(report, u), ''];
   const k = report.counts;
 
-  const atRisk = report.unique.filter((u) => u.uncommittedOnlyCount > 0);
+  const generatedResidue = report.unique.filter((u) => u.sourceSettledGeneratedOnly);
+  const atRisk = report.unique.filter((u) => u.uncommittedOnlyCount > 0 && !u.sourceSettledGeneratedOnly);
   const uniqueCommitted = report.unique.filter(
     (u) => u.uncommittedOnlyCount === 0 && u.uniqueSymbolCount > 0,
   );
@@ -214,6 +221,16 @@ export function renderSummary(report) {
     `  ${c('green', padStart(k.safeToDelete, 4))}  disposable     ` +
     c('grey', 'provably nothing to lose'),
   );
+  if ((k.activeOwnership ?? 0) || (k.ownershipNeedsReview ?? 0)) {
+    out.push(
+      `  ${c('yellow', padStart(k.activeOwnership ?? 0, 4))}  owned          `
+      + c('grey', 'explicit live leases block cleanup; unclaimed does not assert inactivity'),
+    );
+  }
+  out.push(
+    `  ${c('yellow', padStart(generatedResidue.length, 4))}  generated      ` +
+    c('grey', 'only manifest-backed generated paths found; still not disposable'),
+  );
 
   if (atRisk.length) {
     out.push('', c('bold', 'AT RISK — delete these and the work is gone'));
@@ -230,6 +247,16 @@ export function renderSummary(report) {
       }
     }
     if (atRisk.length > 12) out.push(c('grey', `  … and ${atRisk.length - 12} more`));
+  }
+
+  if (generatedResidue.length) {
+    out.push('', c('bold', 'GENERATED RESIDUE: only manifest-backed generated paths were found'));
+    out.push(c('grey', '  This does not make the worktree disposable: the local bytes may be patched or hold data.'));
+    out.push('');
+    for (const r of generatedResidue.slice(0, 12)) {
+      out.push(`  ${u.cell(r.id, 34, ID)} ${c('grey', r.generatedIgnoredPaths.map((p) => u.take(p, ID)).join('  '))}`);
+    }
+    if (generatedResidue.length > 12) out.push(c('grey', `  … and ${generatedResidue.length - 12} more`));
   }
 
   out.push(...stashSection(report, u));
@@ -371,11 +398,16 @@ export function renderRisk(report) {
   }
   out.push(c('grey', `  ${pad('workstream', 34)} ${padStart('uniq', 5)} ${padStart('uncomm', 7)}  verdict`));
   for (const r of rows.slice(0, 40)) {
-    const flag = r.uncommittedOnlyCount > 0 ? c('red', '●') : r.uniqueSymbolCount > 0 ? c('yellow', '●') : c('grey', '●');
+    const flag = r.sourceSettledGeneratedOnly
+      ? c('yellow', '●')
+      : r.uncommittedOnlyCount > 0 ? c('red', '●') : r.uniqueSymbolCount > 0 ? c('yellow', '●') : c('grey', '●');
     out.push(
       `  ${flag} ${u.cell(r.id, 32, ID)} ${padStart(r.uniqueSymbolCount, 5)} ${padStart(r.uncommittedOnlyCount, 7)}  ${c('grey', u.take(r.verdict))}`
       + (r.uniqueSymbolCount === 0 && r.uncommittedFileCount > 0
         ? c('grey', `\n      ${r.uncommittedFileCount} uncommitted file(s) with no parseable symbols — still lost if deleted`)
+        : '')
+      + (r.sourceSettledGeneratedOnly
+        ? c('yellow', `\n      only manifest-backed generated path(s): ${(r.generatedIgnoredPaths ?? []).slice(0, 3).map((f) => u.take(f, ID)).join(', ')}; this does not make the worktree disposable`)
         : '')
       // THE 'uniq' COLUMN CAN BE A FLOOR, NOT A TOTAL. ctagsBatch names every file it could not
       // read (a NUL byte tripping the content classifier, a file over the size cap, a timeout) in
@@ -658,7 +690,19 @@ export function renderContext(digest) {
     : digest.familyRule;
   out.push(c('bold', `CONTEXT for ${u.take(digest.workstream, ID)}`) + c('grey', `  (sibling group: ${u.take(ruleHint)})`));
   out.push('');
+  if (digest.ownership?.state === 'active') {
+    out.push(c('yellow', `  your worktree is actively owned by ${u.take(digest.ownership.owner, ID)} until ${u.take(digest.ownership.expiresAt ?? '—')}`), '');
+  } else if (digest.ownership?.state && digest.ownership.state !== 'unclaimed') {
+    out.push(c('yellow', `  ownership needs review: ${u.take(digest.ownership.reason ?? digest.ownership.state)}`), '');
+  }
   if (digest.siblings.length) out.push(c('grey', `  siblings: ${digest.siblings.map((s) => u.take(s, ID)).join(', ')}`), '');
+  if (digest.activeOwners?.length) {
+    out.push(c('bold', '  ACTIVE OWNERS NEXT DOOR'));
+    for (const row of digest.activeOwners) {
+      out.push(c('grey', `    ${u.take(row.workstream, ID)}  ${u.take(row.ownership.owner, ID)} until ${u.take(row.ownership.expiresAt ?? '—')}`));
+    }
+    out.push('');
+  }
   // `advice` is holt's sentence with repository names interpolated INTO it upstream, in
   // src/analyze.mjs — so by the time it arrives here it is one string and the boundary can only
   // treat the whole line as repository data. That is correct but coarse; the residual note in the
@@ -682,6 +726,30 @@ export function renderContext(digest) {
     out.push('');
   }
   out.push(...provenanceLines(u));
+  return out.join('\n');
+}
+
+/** The explicit liveness plane beside content evidence; never a guessed process status. */
+export function renderOwnership(result) {
+  const u = repoData();
+  const rows = Array.isArray(result?.worktrees)
+    ? result.worktrees
+    : (result?.id ? [result] : []);
+  const out = [c('bold', 'holt ownership') + c('grey', '  explicit local leases; unclaimed does not mean no agent is working')];
+  if (!rows.length) {
+    out.push('', c('grey', '  no worktrees were found'));
+    return out.join('\n');
+  }
+  for (const row of rows) {
+    const lease = row.ownership ?? { state: 'unavailable', reason: 'no ownership evidence' };
+    const state = lease.state === 'active' ? c('yellow', 'ACTIVE')
+      : lease.state === 'unclaimed' ? c('grey', 'unclaimed')
+        : c('red', u.take(String(lease.state ?? 'unavailable')).toUpperCase());
+    out.push(`\n  ${u.cell(row.id ?? 'unknown', 30, ID)} ${state}`);
+    if (lease.owner) out.push(c('grey', `    owner ${u.take(lease.owner, ID)}  until ${u.take(lease.expiresAt ?? '—')}`));
+    if (lease.reason) out.push(c('grey', `    ${u.take(lease.reason)}`));
+  }
+  out.push('', c('grey', '  Active, expired, invalid and unavailable leases all refuse cleanup. Release or explicitly take over a lease; Holt never infers liveness from a process, name or mtime.'));
   return out.join('\n');
 }
 
@@ -730,8 +798,22 @@ export function renderOrder(plan) {
 
 export function renderPartition(plan) {
   const u = repoData();
+  if (plan.mode === 'task-context-required') {
+    return [
+      c('bold', 'holt partition — task context required'),
+      c('yellow', '\n  NO ACTIONABLE ALLOCATION WAS EMITTED'),
+      c('grey', `  ${plan.taskContext.reason}`),
+      c('grey', `  ${plan.taskContext.next}`),
+      ...provenanceLines(u),
+      '',
+    ].join('\n');
+  }
   const out = [c('bold', `holt partition — ${plan.agents} agents`)
     + c('grey', `  (${plan.granularity ?? 'top-level-directory'} · structural advisory, not a task plan)`)];
+  if (plan.fanoutFeasible === false) {
+    out.push(c('yellow', '\n  REQUESTED FAN-OUT IS NOT FEASIBLE')
+      + c('grey', ` — ${plan.fanout?.largestIndivisibleUnitWeight ?? '?'} tracked file(s) are glued into the largest indivisible unit.`));
+  }
   if (plan.taskContext?.status === 'insufficient_task_context') {
     out.push(c('yellow', '\n  INSUFFICIENT TASK CONTEXT')
       + c('grey', ' — no task paths/components were supplied; these buckets describe repository shape only.'));
@@ -749,6 +831,7 @@ export function renderPartition(plan) {
     out.push(`\n  AGENT ${b.agent}  ${c('grey', `${b.weight} tracked file(s)`)}`);
     // A directory name is repository-controlled in exactly the way a worktree basename is.
     out.push(`    ${b.dirs.map((d) => u.take(d, ID)).join('  ')}`);
+    if (b.truncated) out.push(c('grey', `    … ${b.totalDirs - b.returnedDirs} more path unit(s) omitted`));
   }
   if (plan.avoid.length) {
     out.push(`\n  ${c('yellow', 'ALREADY CONTESTED')}  ${c('grey', 'one owner each — currently touched by multiple live workstreams')}`);
@@ -757,10 +840,12 @@ export function renderPartition(plan) {
       out.push(`    ${u.take(a.file, ID)}  ${c('grey', `held by ${held}`)}  → agent ${a.assignTo ?? '?'}`);
     }
     // A partitioning plan read as complete is a plan that assigns contested files to nobody.
-    if (plan.avoid.length > 15) {
-      out.push(c('grey', `    … and ${plan.avoid.length - 15} more contested file(s) — 'holt partition --json' lists every one`));
+    const totalAvoid = plan.output?.totalContestedFiles ?? plan.avoid.length;
+    if (totalAvoid > 15) {
+      out.push(c('grey', `    … and ${totalAvoid - 15} more contested file(s) — narrow with --path/--component`));
     }
   }
+  if (plan.output?.truncated && plan.next) out.push(c('grey', `\n  ${plan.next}`));
   out.push(...provenanceLines(u));
   out.push('');
   return out.join('\n');

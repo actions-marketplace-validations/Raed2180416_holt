@@ -14,7 +14,8 @@ import fsp from 'node:fs/promises';
 import { standardFixture, emptyFixture, newRepo, backdateWorktreeCreation } from '../fixtures.mjs';
 import { discover } from '../../src/discover.mjs';
 import { scan } from '../../src/scan.mjs';
-import { analyze, contextDigest, duplicates } from '../../src/analyze.mjs';
+import { analyze, contextDigest, duplicates, landingPlan } from '../../src/analyze.mjs';
+import { renderSummary } from '../../src/render.mjs';
 
 async function inspectFixture(fx, opts = {}) {
   const disc = await discover(fx.root, opts);
@@ -74,6 +75,57 @@ test('P0 PRESENCE: committed unique work is detected and NOT confused with at-ri
   assert.equal(row.uncommittedOnlyCount, 0, 'committed work must not be reported as uncommitted-only');
   assert.ok(row.uniqueSymbols.includes(truth.committedOnlySymbol),
     `expected ${truth.committedOnlySymbol}, got: ${row.uniqueSymbols.join(', ')}`);
+});
+
+test('P0 CLARITY: a settled source tree with a local dependency install is separate from source work at risk', async (t) => {
+  const fx = await newRepo('generated-residue');
+  t.after(() => fx.cleanup());
+  await fx.write('.gitignore', 'node_modules/\n.env.local\n');
+  await fx.write('package.json', '{"name":"fixture","private":true}\n');
+  await fx.commit('declare the JavaScript project and its ignored local state');
+
+  const installOnly = await fx.worktree('install-only');
+  await fx.write('node_modules/example/index.js', 'module.exports = 1;\n', installOnly);
+
+  const mixed = await fx.worktree('mixed-ignored');
+  await fx.write('node_modules/example/index.js', 'module.exports = 1;\n', mixed);
+  await fx.write('.env.local', 'TOKEN=the-only-copy\n', mixed);
+
+  const { report } = await inspectFixture(fx);
+  const installRow = byId(report.unique, 'install-only');
+  const mixedRow = byId(report.unique, 'mixed-ignored');
+
+  assert.equal(installRow.sourceSettledGeneratedOnly, true,
+    `an otherwise-settled checkout with a manifest-backed install needs its own category: ${JSON.stringify(installRow)}`);
+  assert.deepEqual(installRow.generatedIgnoredPaths, ['node_modules/']);
+  assert.deepEqual(installRow.otherIgnoredPaths, []);
+  assert.equal(report.safe.find((row) => row.id === 'install-only')?.safe, false,
+    'a generated directory name plus a manifest is never deletion authority');
+
+  assert.equal(mixedRow.sourceSettledGeneratedOnly, false,
+    'a local secret beside the install must stay in the ordinary at-risk set');
+  assert.deepEqual(mixedRow.otherIgnoredPaths, ['.env.local']);
+
+  const rendered = renderSummary(report);
+  assert.match(rendered, /GENERATED RESIDUE/,
+    'the default view must name the user-facing category instead of calling an install source work');
+  assert.match(rendered, /install-only[\s\S]*node_modules\//);
+  assert.match(rendered, /does not make the worktree disposable/i);
+  assert.match(rendered, /mixed-ignored/,
+    'the worktree with a secret must remain visible in the ordinary at-risk section');
+
+  const noManifest = await newRepo('generated-residue-no-manifest');
+  t.after(() => noManifest.cleanup());
+  await noManifest.write('.gitignore', 'node_modules/\n');
+  await noManifest.commit('ignore a directory without declaring how to recreate it');
+  const unexplained = await noManifest.worktree('unexplained-node-modules');
+  await noManifest.write('node_modules/example/index.js', 'module.exports = 1;\n', unexplained);
+
+  const { report: noManifestReport } = await inspectFixture(noManifest);
+  const unexplainedRow = byId(noManifestReport.unique, 'unexplained-node-modules');
+  assert.equal(unexplainedRow.sourceSettledGeneratedOnly, false,
+    'a folder name without its recreating manifest must remain ordinary ignored content');
+  assert.deepEqual(unexplainedRow.otherIgnoredPaths, ['node_modules/']);
 });
 
 test('P0 AUTHORITY: same-named symbols at different paths remain distinct work instances', async (t) => {
@@ -883,6 +935,39 @@ test('P5 COLLAPSE: exact fan-out copies collapse only when every copy is durable
   assert.equal(report.plan.collapse.some((x) => x.id === 'uncommitted-copy' || x.into === 'uncommitted-copy'), false,
     `uncommitted work must stay in the review queue: ${JSON.stringify(report.plan.collapse)}`);
   assert.ok(report.plan.order.some((x) => x.id === 'uncommitted-copy'), 'uncommitted work must remain ordered for review');
+});
+
+test('P5 COLLAPSE: directional redundancy never hides the dirty worktree holding the copy', () => {
+  const common = {
+    family: 'fixture', ok: true, added: [], addedKeys: [], symbolsUnmeasured: [],
+    ignored: { count: 0, files: [], how: 'measured' },
+  };
+  const clean = {
+    ...common,
+    id: 'a-clean', path: '/tmp/a-clean', touched: ['x.js'],
+    contentKeys: { 'x.js': 'same-on-disk-bytes' },
+    committed: {
+      count: 1, files: ['x.js'], identities: { 'x.js': 'same-committed-entry' }, mergedTree: 'tree-a',
+    },
+    uncommitted: { count: 0, files: [], untracked: [], how: 'status' },
+  };
+  const dirty = {
+    ...common,
+    id: 'z-dirty', path: '/tmp/z-dirty', touched: ['x.js', 'dirty.txt'],
+    contentKeys: { 'x.js': 'same-on-disk-bytes', 'dirty.txt': 'dirty-only-bytes' },
+    committed: {
+      count: 1, files: ['x.js'], identities: { 'x.js': 'same-committed-entry' }, mergedTree: 'tree-b',
+    },
+    uncommitted: { count: 1, files: ['dirty.txt'], untracked: [], how: 'status' },
+  };
+
+  const plan = landingPlan({ workstreams: [clean, dirty] }, {
+    collisions: [], duplicates: [], collapse: true,
+  });
+  assert.equal(plan.collapse.some((row) => row.id === 'z-dirty'), false,
+    `directional A-is-held-by-B evidence cannot make unsafe B disappear: ${JSON.stringify(plan.collapse)}`);
+  assert.ok(plan.order.some((row) => row.id === 'z-dirty'),
+    `the dirty holder must remain explicitly reviewable: ${JSON.stringify(plan)}`);
 });
 
 /* ------------------------------------------------------ negative control ---- */

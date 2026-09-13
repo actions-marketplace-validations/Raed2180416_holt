@@ -66,7 +66,7 @@ test('site: the first copied workflow is inspection-only and names its runtime b
   const html = await fs.readFile(path.join(SITE, 'index.html'), 'utf8');
   const payload = /var command = '([^']+)'/.exec(html)?.[1] ?? '';
   assert.ok(payload, 'copy payload was not found');
-  assert.match(payload, /holt --version\\nholt doctor\\nholt status\\nholt risk/);
+  assert.match(payload, /^npm exec --yes --loglevel=error --allow-remote=root --package=https:\/\/github\.com\/Raed2180416\/holt\/releases\/latest\/download\/holt\.tgz -- holt risk --strict-read-only --no-symbols --include-primary$/);
   assert.doesNotMatch(payload,
     /holt (?:auto|protect|unprotect|rescue|clean|restore|purge|discard|setup|integrate|uninstall)\b/,
     'the first-paste workflow must not mutate Git, locks, quarantine, files, or host configuration');
@@ -99,18 +99,20 @@ test('site: small public text combinations meet WCAG AA contrast', async () => {
   }
 });
 
-test('site: only the canonical landing page is invited into search indexes', async () => {
-  const [index, thanks, robots, sitemap] = await Promise.all([
+test('site: public landing and guide routes are indexed, while prototypes stay excluded', async () => {
+  const [index, thanks, robots, sitemap, cleanupGuide, dependencyGuide] = await Promise.all([
     fs.readFile(path.join(SITE, 'index.html'), 'utf8'),
     fs.readFile(path.join(SITE, 'thanks.html'), 'utf8'),
     fs.readFile(path.join(SITE, 'robots.txt'), 'utf8'),
     fs.readFile(path.join(SITE, 'sitemap.xml'), 'utf8'),
+    fs.readFile(path.join(SITE, 'git-worktree-cleanup.html'), 'utf8'),
+    fs.readFile(path.join(SITE, 'worktree-dependency-bloat.html'), 'utf8'),
   ]);
 
   assert.match(index, /<meta name="robots" content="index,follow">/);
   assert.match(index, /<link rel="canonical" href="https:\/\/raed2180416\.github\.io\/holt\/">/);
-  assert.match(index, /<meta property="og:image:width" content="1079">/);
-  assert.match(index, /<meta property="og:image:height" content="392">/);
+  assert.match(index, /<meta property="og:image:width" content="1200">/);
+  assert.match(index, /<meta property="og:image:height" content="630">/);
   assert.match(thanks, /<meta name="robots" content="noindex,follow">/);
 
   for (const name of ['logo-prototype.html', 'logo-prototype-v2.html', 'logo-prototype-v3.html', 'logo-prototype-v4.html']) {
@@ -122,6 +124,16 @@ test('site: only the canonical landing page is invited into search indexes', asy
 
   assert.match(robots, /Sitemap: https:\/\/raed2180416\.github\.io\/holt\/sitemap\.xml/);
   assert.match(sitemap, /<loc>https:\/\/raed2180416\.github\.io\/holt\/<\/loc>/);
-  assert.equal((sitemap.match(/<url>/g) || []).length, 1,
+  assert.match(sitemap, /<loc>https:\/\/raed2180416\.github\.io\/holt\/git-worktree-cleanup\.html<\/loc>/);
+  assert.match(sitemap, /<loc>https:\/\/raed2180416\.github\.io\/holt\/worktree-dependency-bloat\.html<\/loc>/);
+  assert.match(cleanupGuide, /<meta name="robots" content="index,follow">/);
+  assert.match(cleanupGuide, /<link rel="canonical" href="https:\/\/raed2180416\.github\.io\/holt\/git-worktree-cleanup\.html">/);
+  assert.match(dependencyGuide, /<meta name="robots" content="index,follow">/);
+  assert.match(dependencyGuide, /<link rel="canonical" href="https:\/\/raed2180416\.github\.io\/holt\/worktree-dependency-bloat\.html">/);
+  assert.match(dependencyGuide, /Holt does not deduplicate dependencies/,
+    'the guide must keep package-manager disk reclamation separate from Holt\'s worktree evidence');
+  assert.doesNotMatch(dependencyGuide, /rm\s+-rf\s+(?:\.\/)?node_modules/,
+    'a public safety guide must not make raw removal of a worktree dependency directory its default advice');
+  assert.equal((sitemap.match(/<url>/g) || []).length, 3,
     'prototype and thank-you routes must not appear in the public sitemap');
 });

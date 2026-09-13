@@ -27,6 +27,8 @@ import { git, pmap, worktreeSnapshot, readWorktreeFile } from './git.mjs';
 import { symbolKey } from './symbols.mjs';
 import { isHoltLock } from './discover.mjs';
 import { stashState } from './stash.mjs';
+import { looksGenerated } from './scan.mjs';
+import { ownershipLandingReason } from './ownership.mjs';
 
 /* ------------------------------------------------------------------ helpers ---- */
 
@@ -371,6 +373,24 @@ export function uniqueWork(scanResult) {
       // build output (node_modules, dist, caches — the GENERATED list) before this count ever
       // sees it, so this cannot turn a worktree's dist/ into "unique work".
       const ignoredFileCount = w.ignored?.count ?? 0;
+      const ignoredPaths = w.ignored?.files ?? [];
+      // An ignored directory is not automatically disposable.  A package manifest is evidence
+      // that `node_modules/` can be recreated, but it cannot prove that the copy on disk has no
+      // local patch or data.  This is deliberately a reporting category, never an authority
+      // change: safeToDelete() still sees every ignored byte and refuses a green verdict.
+      const generatedIgnoredPaths = ignoredPaths.filter((file) =>
+        looksGenerated(file, new Set(w.generatedActive ?? [])),
+      );
+      const otherIgnoredPaths = ignoredPaths.filter((file) =>
+        !generatedIgnoredPaths.includes(file),
+      );
+      const sourceSettledGeneratedOnly =
+        w.committed?.count === 0
+        && w.uncommitted?.count === 0
+        && (w.uncommitted?.unmeasured?.length ?? 0) === 0
+        && w.ignored?.how === 'status --ignored'
+        && ignoredPaths.length > 0
+        && otherIgnoredPaths.length === 0;
       const atRiskSymbols = byLayer.uncommitted.length + byLayer.untracked.length;
       const atRisk = Math.max(atRiskSymbols, uncommittedFileCount + ignoredFileCount);
 
@@ -424,6 +444,9 @@ export function uniqueWork(scanResult) {
         uncommittedOnlyCount: atRisk,
         uncommittedFileCount,
         ignoredFileCount,
+        generatedIgnoredPaths,
+        otherIgnoredPaths,
+        sourceSettledGeneratedOnly,
         atRiskSymbolCount: atRiskSymbols,
         committedFiles: w.committed.count,
         // This is an observation, not permission to delete: the current bytes also appear in these
@@ -676,6 +699,30 @@ export function safeToDelete(scanResult, unique = null) {
             + 'but it is not a removable worktree (git itself refuses `git worktree remove` here, '
             + 'and .git lives inside it)'
           : 'this is the repository\'s main working tree, and it holds work base lacks'],
+      };
+    }
+
+    // Live ownership is intentionally independent of file content.  A session can have a clean
+    // directory because its next change still lives in an editor buffer; treating that as an
+    // empty worktree would turn "Holt has not seen bytes yet" into permission to move it away.
+    // A participating owner is therefore hard authority for every cleanup path.  Conversely,
+    // an expired, malformed, unavailable or currently-mutating lease is never proof that nobody
+    // owns the worktree, so it fails closed as UNKNOWN until a person explicitly resolves it.
+    // The main-worktree rule remains first: it is structural authority and must not be obscured
+    // by an otherwise useful live-session status.
+    const ownership = w.ownership;
+    if (ownership?.state === 'active') {
+      return {
+        id: w.id, path: w.path, safe: false, confidence: 'measured', ownership,
+        reasons: [`actively owned by ${ownership.owner} until ${ownership.expiresAt}; release or hand off the ownership lease before cleanup`],
+      };
+    }
+    if (ownership && ownership.state !== 'unclaimed') {
+      return {
+        id: w.id, path: w.path, safe: false, confidence: 'unknown', ownership,
+        reasons: [ownership.state === 'expired'
+          ? `ownership lease held by ${ownership.owner} expired at ${ownership.expiresAt}; expiry is not abandonment, so explicit takeover or owner release is required`
+          : `worktree ownership cannot be established (${ownership.reason ?? ownership.state}); refusing cleanup until it is resolved`],
       };
     }
 
@@ -1640,12 +1687,18 @@ export function contextDigest(scanResult, workstreamId, { maxItems = 12 } = {}) 
   // different, complementary question — "did they touch the same thing" — and is reported
   // separately rather than used to second-guess who the dispatch actually contained.
   const siblings = live.filter((w) => w.family === me.family && w.id !== me.id).map((w) => w.id);
+  const activeOwners = live
+    .filter((w) => w.id !== me.id && w.ownership?.state === 'active')
+    .map((w) => ({ workstream: w.id, ownership: w.ownership }))
+    .slice(0, maxItems);
 
   return {
     ok: true,
     workstream: me.id,
     family: me.family,
     familyRule: me.familyRule,
+    ownership: me.ownership ?? { state: 'unavailable', reason: 'no ownership evidence was collected for this workstream' },
+    activeOwners,
     siblings,
     contestedFiles: contested.slice(0, maxItems),
     duplicatedSymbols: alreadyBuilt.slice(0, maxItems),
@@ -1729,10 +1782,18 @@ export function landingPlan(scanResult, {
   // The primary is evidence, not a branch an agent should land or collapse. Keep it in the
   // overall scan but remove it from the candidate map so every downstream operation inherits the
   // same boundary instead of having to remember a renderer-only exclusion.
-  const candidatesLive = live.filter((w) => !isPrimary(w));
+  const reviewableLive = live.filter((w) => !isPrimary(w));
+  const candidatesLive = reviewableLive.filter((w) => !ownershipLandingReason(w.ownership));
   const workstreamById = new Map(candidatesLive.map((w) => [w.id, w]));
   const supersededBy = new Map();
   const collapseEvidence = new Map();
+  const collapseEvidenceByMember = new Map();
+  const rememberCollapseEvidence = (d) => {
+    for (const id of [d.a, d.b]) {
+      if (!collapseEvidenceByMember.has(id)) collapseEvidenceByMember.set(id, []);
+      collapseEvidenceByMember.get(id).push(d);
+    }
+  };
   const parent = new Map();
   const find = (id) => {
     if (!parent.has(id)) parent.set(id, id);
@@ -1748,7 +1809,11 @@ export function landingPlan(scanResult, {
   };
   const durableDuplicate = (a, b) => {
     const ua = uniqById.get(a.id), ub = uniqById.get(b.id);
-    if (!ua || !ub || ua.uncommittedOnlyCount > 0 || ub.uncommittedOnlyCount > 0) return false;
+    if (!ua || !ub || !safeIds.has(a.id) || !safeIds.has(b.id)
+      || ua.uncommittedOnlyCount > 0 || ub.uncommittedOnlyCount > 0
+      || (a.uncommitted?.count ?? 0) > 0 || (b.uncommitted?.count ?? 0) > 0
+      || (a.ignored?.count ?? 0) > 0 || (b.ignored?.count ?? 0) > 0
+      || (a.symbolsUnmeasured?.length ?? 0) > 0 || (b.symbolsUnmeasured?.length ?? 0) > 0) return false;
     const aTree = a.committed?.mergedTree;
     const bTree = b.committed?.mergedTree;
     return Boolean(aTree && bTree && aTree === bTree);
@@ -1765,13 +1830,18 @@ export function landingPlan(scanResult, {
       if (!durableDuplicate(a, b)) continue;
       union(d.a, d.b);
       collapseEvidence.set(`${d.a}\0${d.b}`, d);
+      rememberCollapseEvidence(d);
     }
     // Content identity is a stronger duplicate instrument than symbol identity. Safe redundant
     // rows therefore participate in the same review cluster even when no symbol was extractable.
     for (const s of safe) {
-      if (!s.safe || !s.redundantWith?.length) continue;
+      if (!safeIds.has(s.id) || !s.redundantWith?.length) continue;
       for (const other of s.redundantWith) {
-        if (workstreamById.has(other)) union(s.id, other);
+        const a = workstreamById.get(s.id), b = workstreamById.get(other);
+        // `redundantWith` is directional: A may be removable because B holds A, while B can also
+        // contain dirty work of its own. Union-find is symmetric, so only admit the pair after the
+        // complete exact-safe predicate proves BOTH sides are clean, measured tree twins.
+        if (a && b && durableDuplicate(a, b)) union(s.id, other);
       }
     }
 
@@ -1789,9 +1859,10 @@ export function landingPlan(scanResult, {
       for (const id of members) {
         if (id === representative) continue;
         supersededBy.set(id, representative);
-        const evidence = [...collapseEvidence.values()].find((d) =>
-          (d.a === id && d.b === representative) || (d.a === representative && d.b === id)
-          || (d.a === id && members.includes(d.b)) || (d.b === id && members.includes(d.a)));
+        // Every recorded evidence pair also performed a union, so a member's first evidence
+        // entry is necessarily inside its final union-find component. Avoid rescanning the
+        // member's evidence list for a partner that the component already proves.
+        const evidence = collapseEvidenceByMember.get(id)?.[0];
         if (evidence) collapseEvidence.set(id, evidence);
       }
     }
@@ -1840,13 +1911,14 @@ export function landingPlan(scanResult, {
       toReview: toLand.length,
       excluded: live.length - candidatesLive.length,
     },
-    reviewSurface: reviewSurface(candidatesLive, safeIds),
-    excluded: live.filter(isPrimary).map((w) => ({
+    reviewSurface: reviewSurface(reviewableLive, safeIds),
+    excluded: live.filter((w) => isPrimary(w) || ownershipLandingReason(w.ownership)).map((w) => ({
       id: w.id,
-      reason: 'primary worktree is evidence, not a landing candidate',
+      reason: isPrimary(w) ? 'primary worktree is evidence, not a landing candidate'
+        : ownershipLandingReason(w.ownership),
     })),
     note: 'holt produces the ORDER. Executing rebases is git-machete / stack-pr / Graphite territory. '
-      + 'The primary worktree is excluded from landing candidates.',
+      + 'The primary worktree and unresolved session claims are excluded from landing candidates.',
   };
 }
 
@@ -1952,6 +2024,7 @@ export function buildGraph(scanResult, { collisions: cols = [], duplicates: dups
       uncommittedOnly: uniqById.get(w.id)?.uncommittedOnlyCount ?? 0,
       safeToDelete: safe.get(w.id)?.safe ?? false,
       verdict: uniqById.get(w.id)?.verdict ?? 'unknown',
+      ownership: w.ownership ?? { state: 'unavailable', reason: 'no ownership evidence was collected for this workstream' },
       ...(redundantWith?.length ? { redundantWith } : {}),
     };
   });
@@ -2016,6 +2089,7 @@ export async function analyze(scanResult, opts = {}) {
   // full coverage, which is how a tool quietly starts lying about what it looked at.
   const live = scanResult.workstreams.filter((w) => w.ok);
   const { dropped, limit } = discriminativeSymbols(live);
+  const ownership = live.map((w) => w.ownership ?? { state: 'unavailable' });
 
   // ---- THE STASH, WHICH THIS REPORT'S OWN PREMISE MADE INVISIBLE ---------------------------
   //
@@ -2067,6 +2141,8 @@ export async function analyze(scanResult, opts = {}) {
       // make a number that drives worktree decisions move for a reason that has nothing to do
       // with any worktree.
       stashAtRisk: stash.atRisk.length,
+      activeOwnership: ownership.filter((lease) => lease.state === 'active').length,
+      ownershipNeedsReview: ownership.filter((lease) => !['active', 'unclaimed'].includes(lease.state)).length,
     },
     stash,
     unique: uniq,
